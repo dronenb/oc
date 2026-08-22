@@ -3,6 +3,8 @@ package whoami
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -17,8 +19,11 @@ import (
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/client-go/kubernetes"
 	authenticationv1client "k8s.io/client-go/kubernetes/typed/authentication/v1"
+	clientauthenticationapi "k8s.io/client-go/pkg/apis/clientauthentication"
+	"k8s.io/client-go/plugin/pkg/client/auth/exec"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/client-go/transport"
 	"k8s.io/klog/v2"
 	kcmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
@@ -54,6 +59,11 @@ type WhoAmIOptions struct {
 	ShowContext    bool
 	ShowServer     bool
 	ShowConsoleUrl bool
+
+	// resolvedToken holds the bearer token resolved during Validate(), which may
+	// come directly from the kubeconfig AuthInfo or, when the current context
+	// uses an exec-based credential plugin, from invoking that plugin.
+	resolvedToken string
 
 	PrintFlags          *genericclioptions.PrintFlags
 	resourcePrinterFunc printers.ResourcePrinterFunc
@@ -152,13 +162,96 @@ func (o *WhoAmIOptions) Validate() error {
 	if o.PrintFlags.OutputFlagSpecified() && (o.ShowToken || o.ShowContext || o.ShowServer || o.ShowConsoleUrl) {
 		return fmt.Errorf("--output cannot be used with --show-token, --show-context, --show-server, or --show-console")
 	}
-	if o.ShowToken && len(o.ClientConfig.BearerToken) == 0 {
-		return fmt.Errorf("no token is currently in use for this session")
+	if o.ShowToken {
+		token, err := resolveBearerToken(o.ClientConfig)
+		if err != nil {
+			return err
+		}
+		if len(token) == 0 {
+			return fmt.Errorf("no token is currently in use for this session")
+		}
+		o.resolvedToken = token
 	}
 	if o.ShowContext && len(o.RawConfig.CurrentContext) == 0 {
 		return fmt.Errorf("no context has been set")
 	}
 	return nil
+}
+
+// resolveBearerToken returns the bearer token that would be used to authenticate
+// requests made with the given rest.Config. If the config carries a static
+// token (AuthInfo.Token/TokenFile), that value is returned directly. If instead
+// the current context authenticates via an exec-based credential plugin
+// (AuthInfo.Exec, e.g. "oc login" OIDC helpers, cloud-provider IAM plugins,
+// etc.), the plugin is invoked so its dynamically-issued token can be resolved
+// and displayed. An empty string with a nil error means no token-based
+// authentication is configured at all (e.g. client-cert auth).
+func resolveBearerToken(restConfig *rest.Config) (string, error) {
+	if len(restConfig.BearerToken) > 0 {
+		return restConfig.BearerToken, nil
+	}
+	if len(restConfig.BearerTokenFile) > 0 {
+		// rest.Config.WrapTransport / TransportConfig already reads BearerTokenFile
+		// contents on each request; for display purposes it's populated into
+		// BearerToken by clientcmd whenever TokenFile is set, so this branch is
+		// effectively unreachable in practice but kept for completeness.
+		return restConfig.BearerToken, nil
+	}
+	if restConfig.ExecProvider == nil {
+		return "", nil
+	}
+
+	execConfig := restConfig.ExecProvider
+	var cluster *clientauthenticationapi.Cluster
+	if execConfig.ProvideClusterInfo {
+		var err error
+		cluster, err = rest.ConfigToExecCluster(restConfig)
+		if err != nil {
+			return "", fmt.Errorf("unable to resolve token from exec credential plugin: %v", err)
+		}
+	}
+
+	authenticator, err := exec.GetAuthenticator(execConfig, cluster)
+	if err != nil {
+		return "", fmt.Errorf("unable to resolve token from exec credential plugin: %v", err)
+	}
+
+	// Drive the authenticator's RoundTripper against a no-op base transport so
+	// we can capture the "Authorization: Bearer <token>" header it injects,
+	// without making a real network call to the API server.
+	transportConfig := &transport.Config{}
+	if err := authenticator.UpdateTransportConfig(transportConfig); err != nil {
+		return "", fmt.Errorf("unable to resolve token from exec credential plugin: %v", err)
+	}
+
+	capture := &capturingRoundTripper{}
+	rt := transportConfig.WrapTransport(capture)
+
+	req, err := http.NewRequest(http.MethodGet, restConfig.Host, nil)
+	if err != nil {
+		return "", fmt.Errorf("unable to resolve token from exec credential plugin: %v", err)
+	}
+	if _, err := rt.RoundTrip(req); err != nil {
+		return "", fmt.Errorf("unable to resolve token from exec credential plugin: %v", err)
+	}
+
+	return strings.TrimPrefix(capture.authHeader, "Bearer "), nil
+}
+
+// capturingRoundTripper is a no-op http.RoundTripper that records the
+// Authorization header set on the request it receives instead of performing
+// any actual network I/O.
+type capturingRoundTripper struct {
+	authHeader string
+}
+
+func (c *capturingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.authHeader = req.Header.Get("Authorization")
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       http.NoBody,
+		Header:     make(http.Header),
+	}, nil
 }
 
 func (o *WhoAmIOptions) getWebConsoleUrl() (string, error) {
@@ -181,7 +274,7 @@ func (o *WhoAmIOptions) getWebConsoleUrl() (string, error) {
 func (o *WhoAmIOptions) Run() error {
 	switch {
 	case o.ShowToken:
-		fmt.Fprintf(o.Out, "%s\n", o.ClientConfig.BearerToken)
+		fmt.Fprintf(o.Out, "%s\n", o.resolvedToken)
 		return nil
 	case o.ShowContext:
 		fmt.Fprintf(o.Out, "%s\n", o.RawConfig.CurrentContext)

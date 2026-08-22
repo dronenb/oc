@@ -20,7 +20,9 @@ import (
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	authfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	core "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/kubectl/pkg/scheme"
 	"sigs.k8s.io/yaml"
 )
@@ -480,5 +482,69 @@ func TestWhoAmIOutputJSONFallbackToUserAPI(t *testing.T) {
 
 	if diff := cmp.Diff(expectedUser, actualUser); diff != "" {
 		t.Errorf("User mismatch (-expected +actual):\n%s", diff)
+	}
+}
+
+func TestResolveBearerTokenStaticToken(t *testing.T) {
+	restConfig := &rest.Config{
+		BearerToken: "static-token-value",
+	}
+
+	token, err := resolveBearerToken(restConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "static-token-value" {
+		t.Errorf("expected %q, got %q", "static-token-value", token)
+	}
+}
+
+func TestResolveBearerTokenNoAuth(t *testing.T) {
+	restConfig := &rest.Config{}
+
+	token, err := resolveBearerToken(restConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "" {
+		t.Errorf("expected empty token, got %q", token)
+	}
+}
+
+func TestResolveBearerTokenExecProvider(t *testing.T) {
+	// A minimal exec plugin that prints an ExecCredential with a fixed token.
+	// Using /bin/sh -c so the test doesn't depend on any external binary.
+	script := `printf '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"exec-plugin-token"}}'`
+
+	restConfig := &rest.Config{
+		ExecProvider: &api.ExecConfig{
+			Command:         "/bin/sh",
+			Args:            []string{"-c", script},
+			APIVersion:      "client.authentication.k8s.io/v1",
+			InteractiveMode: api.NeverExecInteractiveMode,
+		},
+	}
+
+	token, err := resolveBearerToken(restConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "exec-plugin-token" {
+		t.Errorf("expected %q, got %q", "exec-plugin-token", token)
+	}
+}
+
+func TestResolveBearerTokenExecProviderFailure(t *testing.T) {
+	restConfig := &rest.Config{
+		ExecProvider: &api.ExecConfig{
+			Command:         "/bin/sh",
+			Args:            []string{"-c", "exit 1"},
+			APIVersion:      "client.authentication.k8s.io/v1",
+			InteractiveMode: api.NeverExecInteractiveMode,
+		},
+	}
+
+	if _, err := resolveBearerToken(restConfig); err == nil {
+		t.Fatalf("expected an error from a failing exec plugin, got nil")
 	}
 }
